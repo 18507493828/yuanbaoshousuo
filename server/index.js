@@ -176,6 +176,8 @@ async function runQuery(q, options) {
 /* ── 个股模式：把一组页面收成「一只票 + 一串消息」 ── */
 
 const MESSAGE_CAP = 24
+// 提到这只票的页面够这么多条，就只留这些，不再拿别家公司的页面凑数
+const MIN_OWN_MESSAGES = 8
 
 /** 页面 → 消息：按 URL、标题去重，相关的排前面，其次按日期倒序 */
 function collectMessages(pages, focus) {
@@ -219,7 +221,12 @@ function collectMessages(pages, focus) {
       Number(b.relevant) - Number(a.relevant) ||
       String(b.date || '').localeCompare(String(a.date || ''))
   )
-  return out.slice(0, MESSAGE_CAP)
+
+  // 用户问的是一只票，列表里就不该混进别家公司：先只留正文或标题提到这只票的页面。
+  // 这类页面不够时（公司太小、检索面窄）才用其余页面补齐，保证消息量不至于空。
+  const own = focus?.name ? out.filter((m) => m.relevant) : out
+  const pool = own.length >= MIN_OWN_MESSAGES ? own : out
+  return pool.slice(0, MESSAGE_CAP)
 }
 
 /**

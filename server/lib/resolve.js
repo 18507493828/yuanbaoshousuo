@@ -18,6 +18,9 @@ import { classifyCode } from './extract.js'
 const SUGGEST_URL = 'https://smartbox.gtimg.cn/s3/'
 const TIMEOUT_MS = 3500
 const TTL = 30 * 60 * 1000
+// 逐字回退会多打几次联想接口，给一个总时长和总次数上限，避免行业词拖慢整轮检索
+const MAX_RESOLVE_MS = 4000
+const MAX_TRIES = 6
 
 const cache = new Map()
 
@@ -26,14 +29,28 @@ const UA =
 
 /** 长词放前面，避免「怎么样」被「怎么」先吃掉一半 */
 const NOISE = [
-  '怎么样', '怎么办', '怎么看', '能买吗', '可以买吗', '值得买吗', '值不值', '分析一下', '分析下',
-  '研究一下', '点评一下', '解读一下', '看一下', '看下', '看看', '说说', '讲讲', '聊聊', '介绍下',
-  '介绍一下', '梳理一下', '判断一下', '评估一下', '帮我', '帮忙', '麻烦', '请', '分析', '研究',
-  '点评', '解读', '介绍', '梳理', '判断', '评估', '如何', '怎么', '值得', '现在', '目前', '最近',
-  '近期', '今天', '明天', '后市', '走势', '行情', '估值', '基本面', '消息', '情况', '最新', '一下',
-  '这只', '那个', '个股', '股票', '股价', '多少', '能买', '买入', '卖出', '持有', '加仓', '减仓',
+  // 问法
+  '怎么样', '怎么办', '怎么看', '怎么走', '能买吗', '可以买吗', '值得买吗', '值不值得', '值不值',
+  '能不能买', '该不该买', '要不要买', '会不会涨', '会不会跌', '还有机会吗', '有机会吗', '能上车吗',
+  '分析一下', '分析下', '研究一下', '点评一下', '解读一下', '看一下', '看下', '看看', '说说', '讲讲',
+  '聊聊', '介绍下', '介绍一下', '梳理一下', '判断一下', '评估一下', '了解一下',
+  // 指代这只票：「帮我分析中国中免这支股票」这类句子，尾巴必须一起去掉
+  '这支股票', '这只股票', '这个股票', '这支票', '这只票', '这个票', '这家公司', '该公司', '这个个股',
+  '这支个股', '这只个股', '这支', '这只', '那个', '这家', '这个',
+  // 客套、动词、时间与角度词
+  '帮我', '帮忙', '麻烦', '请问', '想问', '想知道', '请', '分析', '研究', '点评', '解读', '介绍', '梳理',
+  '判断', '评估', '如何', '怎么', '值得', '现在', '目前', '最近', '近期', '今天', '明天', '后市',
+  '走势', '行情', '估值', '基本面', '消息', '情况', '最新', '一下', '个股', '股票', '股价', '多少',
+  '能买', '买入', '卖出', '持有', '加仓', '减仓', '未来', '后续', '前景', '还有', '机会',
   '的', '吗', '呢', '吧', '啊', '呀', '么'
 ]
+
+/**
+ * 句尾残留的判断：名字后面剩下的字只允许是这些「口水字」。
+ * 用来挡住「宠物食品」被截成「宠物」这种误认——「食品」不在集合里，就不会被当成尾巴。
+ */
+const TAIL_NOISE_RE =
+  /^[的了吗呢吧啊呀嘛哦呗这那哪支只个股票据还有机怎值买看说讲评研分介梳判估新近前后未得能要想问情势走样行很太该当其什为靠涨跌多少高低好不也都还会]+$/
 
 const NOISE_RE = new RegExp(NOISE.join('|'), 'g')
 
@@ -139,12 +156,49 @@ function pick(clean, rows) {
   return null
 }
 
+/** 名字后面剩下的部分是不是纯口水：是才认，否则说明截错了位置 */
+function isNoiseTail(tail) {
+  const t = String(tail || '').replace(/[\s，。！？、；：,.!?;:（）()【】\[\]"'“”‘’]/g, '')
+  return t === '' || TAIL_NOISE_RE.test(t)
+}
+
+/**
+ * 按优先级排出「可能是公司名」的关键词：
+ *   1. 整句（能整句对上，说明没有多余尾巴）
+ *   2. 每个分词
+ *   3. 首段逐字回退（「中国中免这支股票」→「中国中免这」→「中国中免」）
+ * 联想接口是按前缀补全的，尾巴多一个字就返回空，所以回退这一步不能省。
+ * cut=true 表示这个词是从原句上截短来的，命中后要求名字必须顶在句首，不能靠简称反推。
+ */
+function* nameKeys(clean) {
+  const seen = new Set()
+  const ok = (k) =>
+    k.length >= 2 && k.length <= 10 && /^[\u4e00-\u9fa5A-Za-z]+$/.test(k) && !seen.has(k)
+  const take = function* (k, cut) {
+    if (!ok(k)) return
+    seen.add(k)
+    yield { key: k, cut }
+  }
+
+  if (clean.length >= 2 && clean.length <= 10) yield* take(clean, false)
+
+  const tokens = clean.split(/\s+/).filter(Boolean)
+  for (const t of tokens.slice(0, 2)) if (t !== clean) yield* take(t, false)
+
+  const head = tokens[0] || clean
+  for (let n = Math.min(head.length, 10) - 1; n >= 2; n--) {
+    const k = head.slice(0, n)
+    if (k === clean) continue
+    yield* take(k, true)
+  }
+}
+
 /**
  * 识别句子里指向的个股。
  * @param {string} query
  * @returns {Promise<{code:string,market:'SH'|'SZ'|'BJ',board:string,name:string,via:'code'|'name'}|null>}
  */
-export async function resolveStock(query) {
+export async function resolveStock(query, { budget = MAX_RESOLVE_MS } = {}) {
   const text = String(query || '').trim()
   if (!text) return null
 
@@ -159,13 +213,26 @@ export async function resolveStock(query) {
   const clean = cleanQuery(text)
   if (!clean || clean.length > 14) return null
 
-  for (const run of clean.split(' ').filter(Boolean).slice(0, 2)) {
-    if (run.length < 2 || run.length > 10) continue
-    if (!/^[\u4e00-\u9fa5A-Za-z]+$/.test(run)) continue
+  const deadline = Date.now() + budget
+  let tries = 0
 
-    const rows = await suggest(run)
-    const hit = pick(run, rows)
+  for (const { key, cut } of nameKeys(clean)) {
+    if (tries >= MAX_TRIES || Date.now() > deadline) break
+    tries += 1
+
+    const rows = await suggest(key)
+    const hit = pick(key, rows)
     if (!hit) continue
+
+    const at = clean.indexOf(hit.name)
+    if (at === 0) {
+      // 名字顶在句首：后面剩的字要么是口水，要么这个名字本身够长（≥3 字）能自证。
+      // 「中国中免的免税业务怎么样」属于后者；「宠物食品」截出「宠物」则会被挡住。
+      if (!isNoiseTail(clean.slice(hit.name.length)) && hit.name.length < 3) continue
+    } else if (cut) {
+      // 从原句截短后靠简称反推出来的名字（「中国中」→「中国中车」）不可信，直接丢
+      continue
+    }
 
     const cls = classifyCode(hit.code)
     if (!cls) continue

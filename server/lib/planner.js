@@ -126,6 +126,7 @@ function stripConditions(text) {
     .replace(/近\s*(?:一|1|3|三|6|六|12|半)\s*个?(?:月|年|周|季度)|最近\s*\S{0,3}|今天|今日|本周|这周|今年|年内/g, ' ')
     .replace(/业绩预增|预增|预盈|扭亏|业绩|净利|利润/g, ' ')
     .replace(/帮我|请|麻烦|找一下|找找|筛一下|筛选|搜索|搜一下|查一下|看一下|看看|有没有|推荐|整理|一下|给我|要|只想|只看|只要/g, ' ')
+    .replace(/有哪些|哪些公司|哪些股票|哪家强|哪家好|哪个好|好不好|怎么样|怎么看/g, ' ')
     .replace(/的(?:公司|股票|标的|个股|票|股)/g, ' ')
     .replace(/[，。！？、；：,.;:!?]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -417,11 +418,12 @@ export async function planQuery(query) {
 
   const rule = rulePlan(q)
 
-  // 句子指向具体某只票时先走个股路径：不再铺行业检索式，也省掉模型那几秒
-  if (!matchTopic(q)) {
-    const focus = await resolveStock(q).catch(() => null)
-    if (focus) return stockPlan(q, focus)
-  }
+  // 先看这句话是不是在问某一只票：是的话整轮都换成个股路径，不再铺行业检索式。
+  // 句子里同时出现行业词也要照查——「中国中免的免税业务怎么样」问的是那只票，不是免税行业；
+  // 只是这种情况下联想预算压短一点，别让行业类问句多等。
+  const topicHit = matchTopic(q)
+  const focus = await resolveStock(q, { budget: topicHit ? 1500 : undefined }).catch(() => null)
+  if (focus) return stockPlan(q, focus)
 
   // 短句且主题词命中词库时，规则结果已经足够准，不必多花 3 秒
   if (rule.confident || !hy4Enabled()) return rule
